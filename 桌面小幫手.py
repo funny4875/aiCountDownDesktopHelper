@@ -1,17 +1,18 @@
 分科時間=[2026,7,11]
+EXAM_COUNTDOWN_URL = "https://hlmath.tw/exam-countdown/"
+EXAM_NAME = "分科能力測驗"
 import pyautogui
 import pyperclip
 import os
 from tkinter import *
+from tkinter import ttk, messagebox
 import webbrowser
 import threading
 import tkinter.font as font
 import keyboard
 import pyttsx3
 from pytubefix import YouTube
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
-engine.setProperty('voice', voices[0].id)
+engine = None
 
 from PIL import Image, ImageTk
 import time
@@ -22,10 +23,34 @@ import speech_recognition as sr
 
 #google ai
 from google import genai
-AIclient = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+AIclient = None
+AI_API_KEY = None
+AI_MODEL = None
 import re
 
 import datetime
+def 更新分科時間():
+    global 分科時間
+    try:
+        response = requests.get(EXAM_COUNTDOWN_URL, timeout=8)
+        response.raise_for_status()
+        response.encoding = response.encoding or response.apparent_encoding or "utf-8"
+        html = response.text
+        pattern = rf"\d{{3,4}}{EXAM_NAME}.*?舉辦時間：\s*(\d{{3,4}})-(\d{{1,2}})-(\d{{1,2}})"
+        match = re.search(pattern, html, re.S)
+        if not match:
+            raise ValueError(f"找不到 {EXAM_NAME} 的舉辦時間")
+
+        year, month, day = map(int, match.groups())
+        if year < 1911:
+            year += 1911
+        分科時間 = [year, month, day]
+        print(f"已從 {EXAM_COUNTDOWN_URL} 取得{EXAM_NAME}日期：{year}-{month:02d}-{day:02d}")
+        return True
+    except Exception as e:
+        print(f"讀取{EXAM_NAME}日期失敗，沿用預設日期 {分科時間[0]}-{分科時間[1]:02d}-{分科時間[2]:02d}：{e}")
+        return False
+
 def countDown(Y,M,D,m,d,s):
     now = datetime.datetime.now()
     target = datetime.datetime(分科時間[0], 分科時間[1], 分科時間[2], 0, 0, 0)
@@ -118,6 +143,127 @@ def exit(event):
 def popup_menu(event):  # 弹出菜单代码
     popup.post(event.x_root,event.y_root) 
  
+def model_display_name(model):
+    name = getattr(model, "name", str(model))
+    display_name = getattr(model, "display_name", "")
+    if display_name and display_name != name:
+        return f"{name}  ({display_name})"
+    return name
+
+def 設定GoogleAI():
+    global AIclient, AI_API_KEY, AI_MODEL
+    state = {"client": None, "api_key": None, "model": None}
+    model_names = []
+    model_records = []
+
+    setup_root = Tk()
+    setup_root.title("Gemini 模型選擇器")
+    setup_root.geometry("620x245")
+    setup_root.resizable(False, False)
+
+    main = ttk.Frame(setup_root, padding=18)
+    main.pack(fill="both", expand=True)
+
+    ttk.Label(main, text="Gemini API Key").grid(row=0, column=0, sticky="w")
+
+    api_key_entry = ttk.Entry(main, width=58, show="*")
+    api_key_entry.grid(row=1, column=0, padx=(0, 8), pady=(6, 14), sticky="ew")
+
+    ttk.Label(main, text="選擇模型").grid(row=2, column=0, sticky="w")
+
+    model_combo = ttk.Combobox(main, width=75, state="readonly")
+    model_combo.grid(row=3, column=0, columnspan=2, pady=(6, 14), sticky="ew")
+
+    selected_label = ttk.Label(main, text="尚未選擇模型")
+    selected_label.grid(row=4, column=0, columnspan=2, sticky="w")
+
+    button_frame = ttk.Frame(main)
+    button_frame.grid(row=5, column=0, columnspan=2, pady=(12, 0), sticky="e")
+
+    def on_model_selected(_event=None):
+        selected = model_combo.get()
+        if selected:
+            selected_label.config(text=f"已選擇：{selected}")
+
+    def load_models():
+        api_key = api_key_entry.get().strip()
+        if not api_key:
+            messagebox.showwarning("缺少 API Key", "請先輸入 API Key")
+            return
+
+        load_button.config(state="disabled")
+        model_combo.set("正在讀取模型清單...")
+        setup_root.update_idletasks()
+
+        try:
+            client = genai.Client(api_key=api_key)
+            models = list(client.models.list())
+        except Exception as exc:
+            model_combo.set("")
+            messagebox.showerror("讀取失敗", f"無法取得模型清單：\n{exc}")
+            return
+        finally:
+            load_button.config(state="normal")
+
+        if not models:
+            model_combo.set("")
+            messagebox.showinfo("沒有模型", "這個 API Key 目前沒有可用模型。")
+            return
+
+        state["client"] = client
+        state["api_key"] = api_key
+        model_names.clear()
+        model_names.extend(model_display_name(model) for model in models)
+        model_records.clear()
+        model_records.extend(models)
+
+        model_combo["values"] = model_names
+        model_combo.current(0)
+        selected_label.config(text=f"已選擇：{model_names[0]}")
+
+    def confirm():
+        index = model_combo.current()
+        if index < 0:
+            messagebox.showwarning("尚未選擇模型", "請先讀取並選擇模型。")
+            return
+
+        model_name = getattr(model_records[index], "name", model_names[index])
+        state["model"] = model_name.removeprefix("models/")
+        setup_root.destroy()
+
+    def cancel():
+        setup_root.destroy()
+
+    load_button = ttk.Button(main, text="讀取模型清單", command=load_models)
+    load_button.grid(row=1, column=1, pady=(6, 14), sticky="ew")
+
+    model_combo.bind("<<ComboboxSelected>>", on_model_selected)
+    confirm_button = ttk.Button(button_frame, text="確定使用", command=confirm)
+    confirm_button.pack(side="right")
+    ttk.Button(button_frame, text="取消", command=cancel).pack(side="right", padx=(0, 8))
+
+    main.columnconfigure(0, weight=1)
+    setup_root.protocol("WM_DELETE_WINDOW", cancel)
+    api_key_entry.focus_set()
+    setup_root.mainloop()
+
+    if not state["client"] or not state["model"]:
+        return False
+
+    AIclient = state["client"]
+    AI_API_KEY = state["api_key"]
+    AI_MODEL = state["model"]
+    return True
+
+if not 設定GoogleAI():
+    raise SystemExit
+
+更新分科時間()
+
+engine = pyttsx3.init()
+voices = engine.getProperty('voices')
+engine.setProperty('voice', voices[0].id)
+
 root=Tk()  # 主視窗件
 root.withdraw()  # 让窗体隐藏一下
 root.wm_attributes('-topmost',1)  # 让窗体置顶
@@ -146,7 +292,7 @@ la2=Label(root, text="",bd=0,bg="#FFFAFA")
 la2.place(x=200,y=0) #用place定位
 
 la3=Label(root, text="分科倒數:\n",bg="red",bd=1,fg="#FFFFFE",font=("Arial", 30))
-la3.place(x=290,y=200) #用place定位
+la3.place(x=220,y=180) #用place定位
 
 root.overrideredirect(True) # 让窗体无标题栏
 root.wm_attributes("-transparentcolor", "#FFFFFF") # 设置窗体白色透明
@@ -221,6 +367,13 @@ def textReplyLong(T,delay=0.5):#回應文字
     sentences=re.split("[!！?？。\n]+",T)
     for sentence in sentences:
         textReply(sentence,delay)
+
+def GoogleAI產生文字(question):
+    response = AIclient.models.generate_content(
+        model=AI_MODEL,
+        contents=question + "(30字以內)",
+    )
+    return response.text.strip()
         
 def move(dx,dy):
     w = root.winfo_width()
@@ -246,7 +399,7 @@ def autoExecute(program):
     pyautogui.press('enter')
     
 def work(question):
-    global AIclient,img_offset,isRec
+    global AIclient,AI_MODEL,img_offset,isRec
     if img_offset==4:
         if "自律" in question and "學生" in question: img_offset=0
         return
@@ -268,11 +421,14 @@ def work(question):
         autoExecute("notepad")
     else:
         if len(question)<5:textReply('不清楚您的問題');return
-        response = AIclient.models.generate_content(
-            model="gemini-2.5-flash", contents=question+"(30字以內)"
-        )
-        print(response.text)
-        textReplyLong(response.text)
+        try:
+            reply = GoogleAI產生文字(question)
+        except Exception as e:
+            print(f"Google AI 呼叫失敗：{e}")
+            textReply('Google AI 呼叫失敗')
+            return
+        print(reply)
+        textReplyLong(reply)
 
 
         
