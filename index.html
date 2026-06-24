@@ -1,0 +1,267 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Transparent VRM Character (Python)</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;font-family:Segoe UI,sans-serif;color:white;user-select:none;}
+#hud{position:absolute;top:5px;left:5px;background:rgba(0,0,0,0.4);padding:2px 6px;border-radius:4px;font-size:11px;pointer-events:none;opacity:0.6;}
+#close{position:absolute;top:5px;right:5px;width:18px;height:18px;background:rgba(200,50,50,0.4);border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:12px;z-index:100;}
+#close:hover{background:rgba(255,50,50,0.8);}
+body.dragging{cursor:move;}
+</style>
+<script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://unpkg.com/@pixiv/three-vrm@3.0.0/lib/three-vrm.module.js"
+  }
+}
+</script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head><body>
+<div id="hud"><span id="status">loading...</span></div>
+<div id="close" title="Close">×</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+
+window.onload = () => {
+    if (typeof qt !== 'undefined') {
+        new QWebChannel(qt.webChannelTransport, (channel) => {
+            window.vrmHost = channel.objects.vrmHost;
+            initApp();
+        });
+    }
+};
+
+function initApp() {
+    const setStatus = (t) => {
+        const el = document.getElementById('status');
+        if (el) el.innerText = t;
+    };
+    document.getElementById('close').onclick = () => window.vrmHost.closeWindow();
+
+    const qs = new URLSearchParams(location.search);
+    const file = qs.get('file') || 'charactor.vrm';
+
+    const scene = new THREE.Scene();
+    const modelRoot = new THREE.Group();
+    scene.add(modelRoot);
+
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100);
+    camera.position.set(0, 1.2, 6);
+    camera.lookAt(0, 1.2, 0);
+
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, premultipliedAlpha: false });
+    renderer.setClearColor(0x000000, 0);
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    // Renderer settings from TEMP reference
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting from TEMP reference: Hemisphere 2.4, Directional 1.8
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.4));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    dirLight.position.set(1, 3, 4);
+    scene.add(dirLight);
+
+    const loader = new GLTFLoader();
+    loader.register(parser => new VRMLoaderPlugin(parser));
+    
+    let currentVrm = null;
+    let modelCenter = new THREE.Vector3(0, 1, 0);
+    let modelSize = new THREE.Vector3(1, 1.7, 0.5);
+    let userRotationY = 0;
+    let userRotationX = 0;
+    const dragLag = new THREE.Vector3();
+    const dragVelocity = new THREE.Vector3();
+    const baseModelPosition = new THREE.Vector3();
+
+    // Zoom settings
+    let zoomHeight = 600;
+
+    // Mouse Tracking Smoother
+    const mousePosFiltered = new THREE.Vector2(0, 0);
+    const lookAtTarget = new THREE.Object3D();
+    scene.add(lookAtTarget);
+
+    function fitCameraAndWindow() {
+        if (!currentVrm) return;
+        currentVrm.scene.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(currentVrm.scene);
+        box.getCenter(modelCenter);
+        box.getSize(modelSize);
+
+        const aspect = Math.max(0.35, Math.min(1.5, modelSize.x / Math.max(modelSize.y, 0.001)));
+        const charH = zoomHeight;
+        const charW = charH * aspect;
+
+        // Window size with 0.1x padding (total 1.1x)
+        const targetWidth = Math.round(charW * 1.1);
+        const targetHeight = Math.round(charH * 1.1);
+        window.vrmHost.fitWindowToModel(targetWidth, targetHeight);
+
+        const pad = 1.1; 
+        const viewH = Math.max(modelSize.y * pad, 0.1);
+        const viewW = Math.max(modelSize.x * pad, 0.1);
+        
+        camera.left = -viewW / 2;
+        camera.right = viewW / 2;
+        camera.top = viewH / 2;
+        camera.bottom = -viewH / 2;
+        
+        camera.position.set(modelCenter.x, modelCenter.y, modelCenter.z + 6);
+        camera.lookAt(modelCenter);
+        camera.updateProjectionMatrix();
+    }
+
+    function setBoneQuaternion(vrm_obj, name, arr) {
+        if (['head', 'neck'].includes(name.toLowerCase())) return false;
+        const bone = vrm_obj.humanoid?.getNormalizedBoneNode?.(name) || vrm_obj.humanoid?.getRawBoneNode?.(name);
+        if (!bone || !Array.isArray(arr) || arr.length !== 4) return false;
+        bone.quaternion.set(Number(arr[0]), Number(arr[1]), Number(arr[2]), Number(arr[3])).normalize();
+        return true;
+    }
+
+    window.applyPoseData = (data) => {
+        if (!currentVrm) return;
+        try {
+            const poseData = (typeof data === 'string') ? JSON.parse(data) : data;
+            const bones = poseData.data || poseData;
+            for (const [boneName, value] of Object.entries(bones)) {
+                setBoneQuaternion(currentVrm, boneName, value?.rotation);
+            }
+            currentVrm.humanoid?.update?.();
+        } catch (e) { console.error('pose error:', e); }
+    };
+
+    async function loadVrm(url) {
+        setStatus('loading...');
+        try {
+            const base64 = await window.vrmHost.readBinaryFile(url);
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const gltf = await loader.parseAsync(bytes.buffer, '');
+            currentVrm = gltf.userData.vrm;
+            modelRoot.add(currentVrm.scene);
+            VRMUtils.rotateVRM0(currentVrm);
+            
+            if (currentVrm.lookAt) {
+                currentVrm.lookAt.target = lookAtTarget;
+            }
+
+            fitCameraAndWindow();
+            setStatus('ready');
+            await window.vrmHost.updatePose('pose.json');
+        } catch (e) {
+            console.error('load error:', e);
+            setStatus('failed');
+        }
+    }
+
+    let leftDragging = false;
+    let rightDragging = false;
+    let last = null;
+    const mouseRaw = { x: 0, y: 0 };
+
+    addEventListener('contextmenu', (e) => e.preventDefault());
+    addEventListener('mousedown', (e) => {
+        if (e.target?.id === 'close') return;
+        if (e.button === 0) {
+            leftDragging = true;
+            document.body.classList.add('dragging');
+        } else if (e.button === 2) {
+            rightDragging = true;
+        } else return;
+        last = { x: e.screenX, y: e.screenY };
+        e.preventDefault();
+    });
+    addEventListener('mousemove', (e) => {
+        mouseRaw.x = (e.clientX / innerWidth) * 2 - 1;
+        mouseRaw.y = (e.clientY / innerHeight) * 2 - 1;
+
+        if (!last) return;
+        const dx = e.screenX - last.x;
+        const dy = e.screenY - last.y;
+        if (leftDragging) {
+            if (dx || dy) {
+                window.vrmHost.dragWindowBy(dx, dy);
+                dragVelocity.x += -dx * 0.0022;
+                dragVelocity.y += dy * 0.0022;
+            }
+        } else if (rightDragging) {
+            userRotationY += dx * 0.012;
+            userRotationX += dy * 0.006;
+            userRotationX = Math.max(-0.55, Math.min(0.55, userRotationX));
+            modelRoot.rotation.set(userRotationX, userRotationY, 0);
+        }
+        last = { x: e.screenX, y: e.screenY };
+        e.preventDefault();
+    });
+
+    addEventListener('wheel', (e) => {
+        const delta = e.deltaY;
+        if (delta > 0) zoomHeight = Math.max(100, zoomHeight - 50);
+        else zoomHeight = Math.min(2000, zoomHeight + 50);
+        fitCameraAndWindow();
+    });
+
+    function stopDrag() {
+        leftDragging = false;
+        rightDragging = false;
+        last = null;
+        document.body.classList.remove('dragging');
+    }
+    addEventListener('mouseup', stopDrag);
+    addEventListener('mouseleave', stopDrag);
+    addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); fitCameraAndWindow(); });
+    addEventListener('dblclick', (e) => {
+        if (e.button === 0 && window.vrmHost) window.vrmHost.triggerNextPose();
+    });
+
+    const clock = new THREE.Clock();
+    function animate() {
+        requestAnimationFrame(animate);
+        const dt = Math.min(clock.getDelta(), 0.05);
+
+        if (currentVrm) {
+            mousePosFiltered.x = THREE.MathUtils.lerp(mousePosFiltered.x, mouseRaw.x, dt * 5);
+            mousePosFiltered.y = THREE.MathUtils.lerp(mousePosFiltered.y, mouseRaw.y, dt * 5);
+
+            const head = currentVrm.humanoid.getNormalizedBoneNode('head');
+            if (head) {
+                // INCREASED AMPLITUDE: maxYaw 0.8, maxPitch 0.5
+                const maxYaw = 0.8;
+                const maxPitch = 0.5;
+                const yaw = mousePosFiltered.x * maxYaw;
+                const pitch = -mousePosFiltered.y * maxPitch;
+                head.rotation.set(pitch, yaw, 0);
+            }
+            
+            if (currentVrm.lookAt) {
+                const worldX = (mousePosFiltered.x * (camera.right - camera.left)) / 2 + camera.position.x;
+                const worldY = (-(mousePosFiltered.y) * (camera.top - camera.bottom)) / 2 + camera.position.y;
+                lookAtTarget.position.set(worldX, worldY, 2);
+                currentVrm.lookAt.update(dt);
+            }
+        }
+
+        const stiffness = leftDragging ? 30 : 22;
+        const damping = leftDragging ? 5.2 : 4.2;
+        dragVelocity.x += -dragLag.x * stiffness * dt;
+        dragVelocity.y += -dragLag.y * stiffness * dt;
+        dragVelocity.multiplyScalar(Math.max(0, 1 - damping * dt));
+        dragLag.addScaledVector(dragVelocity, dt);
+        modelRoot.position.copy(baseModelPosition).add(dragLag);
+        
+        if (currentVrm) currentVrm.update(dt);
+        renderer.render(scene, camera);
+    }
+    animate();
+    loadVrm(file).catch(e => { console.error(e); });
+}
+</script>
+</body></html>

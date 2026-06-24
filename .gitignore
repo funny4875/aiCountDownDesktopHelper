@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+mp3/
+*.mp3
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+Thumbs.db
